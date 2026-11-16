@@ -33,6 +33,9 @@ CLASS_COLORS = np.array(
     ],
     dtype=np.uint8,
 )
+_CLASS_COLORS_I32 = CLASS_COLORS.astype(np.int32)
+# Off-palette RGB values seen in some RoofD masks (compression / edge bleed).
+_REMAPPED_MASK_COLORS: set[tuple[int, int, int]] = set()
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 IMAGE_DIR_NAMES = {"images", "image", "img", "imgs", "jpegimages", "source", "sources"}
@@ -194,7 +197,19 @@ def read_rgb(path: Path) -> np.ndarray:
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
-def rgb_to_index(mask_rgb: np.ndarray) -> np.ndarray:
+def nearest_class_index(color: tuple[int, int, int]) -> int:
+    """Map an RGB triple to the closest RoofD class color (L2)."""
+    diff = _CLASS_COLORS_I32 - np.asarray(color, dtype=np.int32)
+    return int(np.argmin(np.sum(diff * diff, axis=1)))
+
+
+def rgb_to_index(mask_rgb: np.ndarray, source: str | Path | None = None) -> np.ndarray:
+    """Decode an RGB RoofD mask to class indices 0..5.
+
+    Exact palette hits are preferred. Any off-palette colors (common at
+    compressed / anti-aliased mask edges) are remapped to the nearest class
+    color instead of failing the whole dataset load.
+    """
     if mask_rgb.ndim != 3 or mask_rgb.shape[2] < 3:
         raise ValueError(f"Expected an RGB mask, got shape {mask_rgb.shape}")
     packed = (
@@ -203,13 +218,22 @@ def rgb_to_index(mask_rgb: np.ndarray) -> np.ndarray:
         | mask_rgb[:, :, 2].astype(np.uint32)
     )
     unique, inverse = np.unique(packed, return_inverse=True)
+    exact = {tuple(c): i for i, c in enumerate(CLASS_COLORS.tolist())}
     lookup: dict[int, int] = {}
     for value in unique:
         color = ((int(value) >> 16) & 255, (int(value) >> 8) & 255, int(value) & 255)
-        matches = [i for i, c in enumerate(CLASS_COLORS.tolist()) if tuple(c) == color]
-        if not matches:
-            raise ValueError(f"Mask color {color} is not in the RoofD class map")
-        lookup[int(value)] = matches[0]
+        if color in exact:
+            lookup[int(value)] = exact[color]
+            continue
+        class_id = nearest_class_index(color)
+        lookup[int(value)] = class_id
+        if color not in _REMAPPED_MASK_COLORS:
+            _REMAPPED_MASK_COLORS.add(color)
+            where = f" in {source}" if source is not None else ""
+            print(
+                f"Warning: off-palette mask color {color}{where} "
+                f"→ nearest class '{CLASS_NAMES[class_id]}' {tuple(CLASS_COLORS[class_id])}"
+            )
     mapped = np.array([lookup[int(v)] for v in unique], dtype=np.int64)[inverse]
     return mapped.reshape(mask_rgb.shape[:2])
 
@@ -224,7 +248,7 @@ def read_mask(path: Path) -> np.ndarray:
         return mask.astype(np.int64)
     if mask.shape[2] == 4:
         mask = mask[:, :, :3]
-    return rgb_to_index(cv2.cvtColor(mask, cv2.COLOR_BGR2RGB))
+    return rgb_to_index(cv2.cvtColor(mask, cv2.COLOR_BGR2RGB), source=path)
 
 
 def mask_to_labels(mask: np.ndarray) -> np.ndarray:

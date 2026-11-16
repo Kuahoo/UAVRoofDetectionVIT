@@ -1,0 +1,60 @@
+# Shared configuration for the RoofD inspection prototype.
+# All paths are relative to the repository root unless absolute.
+
+seed: 42
+
+data:
+  # Expected layout: <root>/<train_dir>/{images,masks} and <root>/<test_dir>/{images,masks}.
+  # The loader also accepts image/mask files sharing a directory with *_mask suffixes.
+  root: data/raw/RoofD
+  train_dir: train
+  test_dir: test
+  val_fraction: 0.15
+  # Matches TIDE default allocation (8 CPU cores). Reduce on smaller local machines.
+  num_workers: 8
+  image_size_classifier: 224
+  image_size_unet: 256
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+model:
+  vit_name: vit_base_patch16_224
+  vit_pretrained: true
+  unet_encoder: resnet34
+  unet_encoder_weights: imagenet
+
+training:
+  # Sized for ≥8 GB VRAM; default train host is TIDE L40 (48 GB).
+  batch_size_classifier: 16
+  batch_size_unet: 8
+  epochs_vit_warmup: 5
+  epochs_vit_finetune: 15
+  epochs_unet: 20
+  lr_vit_warmup: 0.001
+  lr_vit_finetune: 0.00001
+  lr_unet: 0.0001
+  weight_decay: 0.01
+  grad_clip: 1.0
+  device: auto
+  amp: true
+
+logistic:
+  image_size: 64
+  solver: lbfgs
+  max_iter: 1000
+  C: 1.0
+
+degradation:
+  # Original test images are 1024x576. Each entry is (width, height).
+  resolutions:
+    - [512, 288]
+    - [256, 144]
+
+paths:
+  outputs: outputs
+  checkpoints: outputs/checkpoints
+  metrics: outputs/metrics
+  figures: outputs/figures
+  splits: outputs/splits.json
+  train_stats: outputs/metrics/train_stats.json
+  test_stats: outputs/metrics/test_stats.json

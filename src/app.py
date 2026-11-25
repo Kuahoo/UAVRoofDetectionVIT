@@ -18,9 +18,11 @@ from src.inference import (
     build_unet,
     conflict_messages,
     detected_defects,
+    fuse_probabilities,
     overlay_mask,
     predict_classification,
-    predict_segmentation,
+    predict_segmentation_probs,
+    unet_presence_probs,
 )
 from src.utils import get_device, load_config, resolve_path
 
@@ -113,10 +115,16 @@ def main() -> None:
     unet_std = unet_ckpt.get("std", cfg["data"]["std"])
 
     probs = predict_classification(vit, image_rgb, vit_size, device, vit_mean, vit_std)
-    mask = predict_segmentation(unet, image_rgb, unet_size, device, unet_mean, unet_std)
+    unet_probs = predict_segmentation_probs(
+        unet, image_rgb, unet_size, device, unet_mean, unet_std
+    )
+    mask = unet_probs.argmax(axis=0).astype(np.int64)
     overlay = overlay_mask(image_rgb, mask)
-    detected = detected_defects(probs)
-    warnings = conflict_messages(probs, mask)
+    presence = unet_presence_probs(unet_probs, cfg["ensemble"]["min_pixels"])
+    fused = fuse_probabilities(probs, presence, cfg["ensemble"]["alpha"])
+    thresholds = np.asarray(vit_ckpt.get("thresholds", 0.5), dtype=np.float32)
+    detected = detected_defects(fused, thresholds)
+    warnings = conflict_messages(probs, mask, thresholds)
 
     left, right = st.columns(2)
     with left:
@@ -126,12 +134,16 @@ def main() -> None:
         st.subheader("U-Net mask overlay")
         st.image(overlay, use_container_width=True)
 
-    st.subheader("ViT defect probabilities")
+    st.subheader("Defect probabilities")
+    cutoffs = np.broadcast_to(thresholds, fused.shape)
     table = pd.DataFrame(
         {
             "Defect": list(DEFECT_CLASS_NAMES),
-            "Probability": [f"{float(p):.1%}" for p in probs],
-            "Detected (>= 50%)": ["yes" if p >= 0.5 else "no" for p in probs],
+            "ViT": [f"{float(p):.1%}" for p in probs],
+            "U-Net": [f"{float(p):.1%}" for p in presence],
+            "Fused": [f"{float(p):.1%}" for p in fused],
+            "Threshold": [f"{float(t):.0%}" for t in cutoffs],
+            "Detected": ["yes" if p >= t else "no" for p, t in zip(fused, cutoffs)],
         }
     )
     st.dataframe(table, use_container_width=True, hide_index=True)
@@ -142,7 +154,7 @@ def main() -> None:
             + ", ".join(f"{name} ({confidence:.0%})" for name, confidence in detected)
         )
     else:
-        st.info("No defect class reached the 50% confidence threshold.")
+        st.info("No defect class reached its tuned confidence threshold.")
 
     spatial_classes = [CLASS_NAMES[i] for i in np.unique(mask) if i > 0]
     st.write(

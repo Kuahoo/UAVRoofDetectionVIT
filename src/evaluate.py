@@ -13,7 +13,13 @@ import torch
 
 from src.data import CLASS_NAMES, RoofDDataset, load_pairs, make_loader
 from src.features import extract_split
-from src.inference import build_classifier, build_unet, logistic_positive_proba
+from src.inference import (
+    build_classifier,
+    build_unet,
+    fuse_probabilities,
+    logistic_positive_proba,
+    unet_presence_probs,
+)
 from src.metrics import (
     classification_metrics_from_probs,
     plot_classification_metrics,
@@ -51,7 +57,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--model", choices=["vit", "unet", "logistic", "all"], default="all")
+    parser.add_argument(
+        "--model",
+        choices=["vit", "unet", "logistic", "ensemble", "all"],
+        default="all",
+    )
     parser.add_argument("--split", choices=["val", "test"], default="test")
     parser.add_argument("--checkpoint")
     parser.add_argument("--degradation", action="store_true")
@@ -117,6 +127,28 @@ def collect_unet(
                 sample_preds = predictions
     elapsed = time.perf_counter() - start
     return confusion, elapsed, sample_images, sample_masks, sample_preds
+
+
+def collect_unet_presence(
+    model: torch.nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    use_amp: bool,
+    min_pixels: Sequence[int],
+) -> tuple[np.ndarray, float]:
+    """Pool each softmax mask into length-5 image-level presence probabilities."""
+    model.eval()
+    start = time.perf_counter()
+    presence = []
+    with torch.no_grad():
+        for batch in loader:
+            images = batch["image"].to(device, non_blocking=True)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                logits = model(images)
+            probs = torch.softmax(logits.float(), dim=1).cpu().numpy()
+            presence.extend(unet_presence_probs(sample, min_pixels) for sample in probs)
+    elapsed = time.perf_counter() - start
+    return np.stack(presence), elapsed
 
 
 def _classification_loader(
@@ -237,13 +269,15 @@ def evaluate_vit(
     mean = ckpt.get("mean", cfg["data"]["mean"])
     std = ckpt.get("std", cfg["data"]["std"])
     image_size = int(ckpt.get("image_size", cfg["data"]["image_size_classifier"]))
+    thresholds = ckpt.get("thresholds", 0.5)
     pairs = load_pairs(cfg, split)
     use_amp, _ = amp_settings(device, bool(cfg["training"]["amp"]))
 
     def run(degrade_resolution: tuple[int, int] | None) -> tuple[dict[str, Any], np.ndarray, np.ndarray, tuple[Any, Any]]:
         loader = _classification_loader(cfg, pairs, image_size, degrade_resolution)
         probs, labels, elapsed, images, true_labels = collect_vit(model, loader, device, use_amp)
-        metrics = classification_metrics_from_probs(probs, labels)
+        metrics = classification_metrics_from_probs(probs, labels, threshold=thresholds)
+        metrics["thresholds"] = thresholds
         metrics["inference_ms_per_image"] = elapsed / len(pairs) * 1000
         return metrics, probs, labels, (images, true_labels)
 
@@ -318,6 +352,68 @@ def evaluate_unet(
     print("U-Net degradation:", {r["label"]: round(r["metrics"]["miou"], 4) for r in results})
 
 
+def evaluate_ensemble(
+    cfg: dict[str, Any],
+    vit_checkpoint: str,
+    unet_checkpoint: str,
+    split: str,
+    device: torch.device,
+    degradation: bool,
+) -> None:
+    vit, vit_ckpt = build_classifier(vit_checkpoint, device)
+    unet, unet_ckpt = build_unet(unet_checkpoint, device)
+    vit_size = int(vit_ckpt.get("image_size", cfg["data"]["image_size_classifier"]))
+    unet_size = int(unet_ckpt.get("image_size", cfg["data"]["image_size_unet"]))
+    mean = vit_ckpt.get("mean", cfg["data"]["mean"])
+    std = vit_ckpt.get("std", cfg["data"]["std"])
+    thresholds = vit_ckpt.get("thresholds", 0.5)
+    alpha = cfg["ensemble"]["alpha"]
+    min_pixels = cfg["ensemble"]["min_pixels"]
+    pairs = load_pairs(cfg, split)
+    use_amp, _ = amp_settings(device, bool(cfg["training"]["amp"]))
+
+    def run(
+        degrade_resolution: tuple[int, int] | None,
+    ) -> tuple[dict[str, Any], np.ndarray, np.ndarray, tuple[Any, Any]]:
+        vit_loader = _classification_loader(cfg, pairs, vit_size, degrade_resolution)
+        vit_probs, labels, vit_elapsed, images, true_labels = collect_vit(
+            vit, vit_loader, device, use_amp
+        )
+        unet_loader = _segmentation_loader(cfg, pairs, unet_size, degrade_resolution)
+        unet_probs, unet_elapsed = collect_unet_presence(
+            unet, unet_loader, device, use_amp, min_pixels
+        )
+        fused = fuse_probabilities(vit_probs, unet_probs, alpha)
+        metrics = classification_metrics_from_probs(fused, labels, threshold=thresholds)
+        metrics["inference_ms_per_image"] = (vit_elapsed + unet_elapsed) / len(pairs) * 1000
+        metrics["thresholds"] = thresholds
+        return metrics, fused, labels, (images, true_labels)
+
+    if not degradation:
+        metrics, probs, labels, samples = run(None)
+        save_classification_reports("ensemble", split, metrics, probs, labels, samples, cfg, mean, std)
+        print(f"Ensemble {split}: macro-F1 {metrics['macro_f1']:.4f}")
+        return
+
+    results = []
+    metrics, _, _, _ = run(None)
+    results.append({"label": "native", "resolution": None, "metrics": metrics})
+    for resolution in cfg["degradation"]["resolutions"]:
+        metrics, _, _, _ = run(tuple(resolution))
+        results.append(
+            {"label": f"{resolution[0]}x{resolution[1]}", "resolution": resolution, "metrics": metrics}
+        )
+    metrics_dir = resolve_path(cfg["paths"]["metrics"])
+    save_json(results, metrics_dir / f"degradation_ensemble_{split}.json")
+    save_degradation_table(results, metrics_dir / f"degradation_ensemble_{split}.csv", "classification")
+    plot_degradation(
+        results,
+        resolve_path(cfg["paths"]["figures"]) / f"degradation_ensemble_{split}.png",
+        "classification",
+    )
+    print("Ensemble degradation:", {r["label"]: round(r["metrics"]["macro_f1"], 4) for r in results})
+
+
 def evaluate_logistic(
     cfg: dict[str, Any],
     checkpoint: str,
@@ -389,16 +485,40 @@ def main() -> None:
     set_seed(cfg["seed"])
     device = get_device(cfg["training"]["device"])
 
-    models = ["vit", "unet", "logistic"] if args.model == "all" else [args.model]
+    models = ["vit", "unet", "logistic", "ensemble"] if args.model == "all" else [args.model]
     if args.checkpoint and len(models) > 1:
         raise ValueError("--checkpoint requires a single --model")
+    if args.checkpoint and args.model == "ensemble":
+        raise ValueError("--model ensemble needs both vit_best.pt and unet_best.pt")
     checkpoints = {
         name: args.checkpoint
         or str(resolve_path(cfg["paths"]["checkpoints"]) / CHECKPOINT_FILES[name])
         for name in models
+        if name != "ensemble"
     }
 
     for name in models:
+        if name == "ensemble":
+            ensemble_checkpoints = {
+                model: str(resolve_path(cfg["paths"]["checkpoints"]) / CHECKPOINT_FILES[model])
+                for model in ("vit", "unet")
+            }
+            missing = [path for path in ensemble_checkpoints.values() if not Path(path).exists()]
+            if missing:
+                if args.model == "all":
+                    print("Skipping ensemble: missing " + ", ".join(missing))
+                    continue
+                raise FileNotFoundError(missing[0])
+            evaluate_ensemble(
+                cfg,
+                ensemble_checkpoints["vit"],
+                ensemble_checkpoints["unet"],
+                args.split,
+                device,
+                args.degradation,
+            )
+            continue
+
         checkpoint = checkpoints[name]
         if not Path(checkpoint).exists():
             if args.model == "all":

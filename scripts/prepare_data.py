@@ -98,6 +98,7 @@ def main() -> None:
     save_json(
         {
             "splits": {name: len(items) for name, items in splits.items()},
+            "group_by": cfg["data"].get("group_by", "tile"),
             "class_names": CLASS_NAMES,
             "class_colors": CLASS_COLORS.tolist(),
         },

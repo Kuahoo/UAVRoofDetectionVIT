@@ -61,10 +61,41 @@ def classification_metrics(
 def classification_metrics_from_probs(
     probs: np.ndarray,
     y_true: Sequence[Sequence[int]],
-    threshold: float = 0.5,
+    threshold: float | Sequence[float] = 0.5,
     class_names: Sequence[str] = DEFECT_CLASS_NAMES,
 ) -> dict[str, Any]:
-    return classification_metrics(np.asarray(y_true) >= 0.5, np.asarray(probs) >= threshold, class_names)
+    predictions = np.asarray(probs) >= np.asarray(threshold)
+    return classification_metrics(
+        np.asarray(y_true) >= 0.5, predictions, class_names
+    )
+
+
+def tune_thresholds(
+    probs: np.ndarray,
+    y_true: Sequence[Sequence[int]],
+    low: float = 0.10,
+    high: float = 0.90,
+    step: float = 0.05,
+    class_names: Sequence[str] = DEFECT_CLASS_NAMES,
+) -> list[float]:
+    """Per-class F1-maximizing thresholds, tuned only on validation data."""
+    probs = np.asarray(probs)
+    targets = np.asarray(y_true) >= 0.5
+    thresholds = []
+    for index in range(len(class_names)):
+        column = probs[:, index]
+        best_threshold = 0.5
+        best_f1 = float(
+            f1_score(targets[:, index], column >= best_threshold, zero_division=0)
+        )
+        for candidate in np.arange(low, high + step / 2, step):
+            f1 = float(
+                f1_score(targets[:, index], column >= candidate, zero_division=0)
+            )
+            if f1 > best_f1:
+                best_threshold, best_f1 = round(float(candidate), 2), f1
+        thresholds.append(best_threshold)
+    return thresholds
 
 
 def _nanmean(values: np.ndarray) -> float:

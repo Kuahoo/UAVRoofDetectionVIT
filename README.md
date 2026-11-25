@@ -12,8 +12,8 @@ are. A logistic-regression baseline provides a course reference point.
 
 | Component | Task | Input | Loss | Output | Primary metric |
 |---|---|---|---|---|---|
-| ViT | Multi-label image classification | 224×224 ImageNet-normalized | Weighted `BCEWithLogitsLoss` | 5 sigmoid probabilities (defects only) | Macro F1 (5 defects) |
-| U-Net | Semantic pixel segmentation | 256×256 ImageNet-normalized | Weighted cross-entropy + Dice | 6-class pixel map (incl. background) | mIoU |
+| ViT | Multi-label image classification | 224×224 ImageNet-normalized | BCE with dampened `pos_weight` | 5 sigmoid probabilities (defects only) | Macro F1 (5 defects) |
+| U-Net | Semantic pixel segmentation | 256×256 ImageNet-normalized | Focal + Dice | 6-class pixel map (incl. background) | mIoU |
 | Baseline | Multi-label image classification | 64×64 grayscale HOG + RGB stats | Log loss (one-vs-rest) | 5 probabilities (defects only) | Macro F1 (5 defects) |
 
 - ViT is the primary implementation focus.
@@ -31,10 +31,10 @@ scripts/make_smoke_data.py    tiny synthetic RoofD-format data for smoke tests
 src/data.py                   shared pairs, mask decoding, targets, augmentations
 src/features.py               HOG + color statistics
 src/train_logistic.py         course baseline
-src/train_vit.py              staged ViT fine-tuning
-src/train_unet.py             weighted CE + Dice U-Net training
-src/evaluate.py               test metrics, figures, degradation experiment
-src/inference.py              checkpoint loading, prediction, overlays, conflicts
+src/train_vit.py              staged ViT fine-tuning + threshold tuning
+src/train_unet.py             Focal + Dice U-Net training
+src/evaluate.py               test metrics, ensemble, figures, degradation experiment
+src/inference.py              checkpoint loading, prediction, fusion, overlays, conflicts
 src/metrics.py                Macro F1, mIoU, Dice, figures
 src/app.py                    Streamlit human-in-the-loop demo
 outputs/                      checkpoints, metrics, figures
@@ -130,10 +130,17 @@ python -m scripts.prepare_data --verify-images
 
 This writes:
 
-- `outputs/splits.json` — deterministic train/val/test split (`seed: 42`)
+- `outputs/splits.json` — deterministic group-aware train/val/test split (`seed: 42`)
 - `outputs/metrics/train_stats.json` — class image/pixel counts plus cached labels
 - `outputs/metrics/test_stats.json` — test counts
 - `outputs/figures/dataset_samples.png` — image/mask/overlay examples
+
+The training split holds out 15% of the training set for validation with
+`GroupShuffleSplit`. `data.group_by: tile` keeps all four of
+`0000_<flight>_<tile>.png` … `0003_<flight>_<tile>.png` on one side of the
+split; `group_by: flight` holds out entire roofs instead. Splitting by raw
+filename would leak augmented copies of the same tile into validation and
+inflate validation F1.
 
 The training scripts reuse the cached statistics, so the 6,400 masks are decoded
 once rather than once per model.
@@ -153,14 +160,19 @@ What each script does:
 - **Logistic** — resizes to 64×64, extracts HOG (grayscale) + RGB mean/variance, fits
   `OneVsRestClassifier(LogisticRegression(solver="lbfgs", max_iter=1000, C=1.0))`
   on the five defect labels.
-- **ViT** — `timm` `vit_base_patch16_224`, ImageNet mean/std, `num_classes=5`.
-  Warm-up: frozen backbone, 5-node head only, AdamW (`lr=1e-3`, `weight_decay=0.01`),
-  5 epochs. Fine-tune: final two transformer blocks + head, AdamW at `1e-5`,
-  cosine annealing, grad clip `1.0`, 15 epochs. Loss is
-  `BCEWithLogitsLoss(pos_weight=negatives/positives)` over the five defect classes
-  (training-set counts only).
-- **U-Net** — ResNet34 ImageNet encoder, 256×256 input, weighted cross-entropy +
-  Dice loss, Adam at `1e-4`, 20 epochs, `ReduceLROnPlateau` on validation mIoU.
+- **ViT** — `timm` `vit_base_patch16_224` (`drop_path_rate=0.2`), ImageNet
+  mean/std, `num_classes=5`. Warm-up: frozen backbone, 5-node head only,
+  AdamW (`lr=1e-3`, `weight_decay=0.01`), 5 epochs. Fine-tune: the trailing six
+  transformer blocks plus head with layer-wise LRs (blocks 6–8 `1e-5`,
+  blocks 9–11 `2e-5`, head `1e-4`), cosine annealing, grad clip `1.0`,
+  15 epochs. Loss is `BCEWithLogitsLoss(pos_weight=sqrt(negatives/positives))`
+  capped at `10` over the five defect classes (training and validation counts,
+  never test).
+  After training, per-class thresholds are swept over `0.10–0.90` on validation
+  (F1-maximizing, `0.5` breaks ties) and stored in the checkpoint.
+- **U-Net** — ResNet34 ImageNet encoder, 256×256 input, Focal loss
+  (`gamma=2`, log-smoothed class weights) + Dice loss weighted equally, Adam at
+  `1e-4`, 40 epochs, `CosineAnnealingLR` (`eta_min=1e-6`).
 
 Artifacts:
 
@@ -173,7 +185,8 @@ outputs/figures/*
 ```
 
 The ViT and U-Net save the best validation checkpoint and report test metrics
-after reloading that checkpoint.
+after reloading that checkpoint. `vit_best.pt` also carries the validation-tuned
+`thresholds`; `evaluate.py` and the Streamlit demo consume them.
 
 ### Smoke test without RoofD
 
@@ -196,9 +209,15 @@ python -m src.evaluate --model all
 python -m src.evaluate --model all --degradation
 ```
 
-- `--model {vit,unet,logistic,all}`
+- `--model {vit,unet,logistic,ensemble,all}`
 - `--split {val,test}` (default `test`)
 - `--checkpoint PATH` for a single model checkpoint
+
+`--model ensemble` pools each U-Net softmax mask into five image-level presence
+probabilities (mean of the top 100/100/40/30/20 pixels) and fuses them with the
+ViT probabilities using per-class weights `alpha=[0.7,0.7,0.7,0.3,0.2]`
+(`configs/default.yaml`). `--model all` evaluates ViT, U-Net, logistic, and the
+ensemble when both deep checkpoints exist.
 
 Standard evaluation writes per-class tables, JSON metrics, probability arrays,
 and figures. The degradation experiment evaluates the native 1024×576 test image
@@ -215,20 +234,24 @@ streamlit run src/app.py
 The sidebar accepts a config path. The app:
 
 1. resizes to 224×224 for the ViT and 256×256 for the U-Net;
-2. shows ViT probabilities for the five defect classes at a 50% threshold;
+2. shows ViT, U-Net presence, and fused probabilities per defect class, with
+   the validation-tuned threshold for each class;
 3. renders the U-Net mask over the original image;
 4. reports deterministic disagreements:
    - **Unlocalized Confidence Warning** — ViT is confident, U-Net found no pixels;
-   - **Sub-threshold Spatial Detection** — U-Net found pixels, ViT is below 50%.
+   - **Sub-threshold Spatial Detection** — U-Net found pixels, ViT is below its
+     class threshold.
 5. never fabricates pixels: the overlay always comes from the U-Net mask.
 
 ## Reproducibility and hardware
 
 - One seed (`42`) controls the split, DataLoader workers, and training.
-- The validation split is 15% of the provided training set; the test set stays
-  untouched until evaluation.
-- `pos_weight` and segmentation class weights are computed from the training set
-  only and cached in `train_stats.json`.
+- The validation split is a grouped 15% of the provided training set: all
+  augmented copies of a tile stay on one side. The test set stays untouched
+  until evaluation.
+- `pos_weight`, segmentation class weights, and per-class thresholds are
+  computed from training/validation data only and cached or stored in the
+  checkpoints.
 - **Primary train host:** TIDE L40 (48 GB). Configured batches are ViT 16 /
   U-Net 8 (also safe on ≥8 GB cards for local smoke debugging).
 - Smoke tests may run on CPU; full ViT/U-Net training should use a TIDE GPU
@@ -240,8 +263,9 @@ The sidebar accepts a config path. The app:
   and patches.
 - Macro F1 averages the five defect classes equally; per-class rare-defect
   recall (patches, breaks) remains the more informative diagnostic.
-- A 50% probability threshold is fixed for the demo and metrics; no threshold
-  tuning is performed.
+- Per-class thresholds are tuned on the same small validation split used for
+  checkpoint selection, so they can overfit; test metrics remain the honest
+  estimate.
 - The dataset is a single public source; results are not evidence of general
   field performance.
 

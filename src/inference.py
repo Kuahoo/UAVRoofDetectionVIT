@@ -81,7 +81,7 @@ def predict_classification(
     return probs.cpu().numpy()
 
 
-def predict_segmentation(
+def predict_segmentation_probs(
     model: torch.nn.Module,
     image_rgb: np.ndarray,
     image_size: int,
@@ -89,11 +89,37 @@ def predict_segmentation(
     mean: Sequence[float] = IMAGENET_MEAN,
     std: Sequence[float] = IMAGENET_STD,
 ) -> np.ndarray:
+    """Return a (6, H, W) float32 softmax map."""
     inputs = _preprocess(image_rgb, image_size, mean, std).to(device)
     with torch.no_grad(), _autocast(device):
         logits = model(inputs)
-        mask = logits.argmax(dim=1)[0]
-    return mask.cpu().numpy().astype(np.int64)
+        probs = torch.softmax(logits.float(), dim=1)[0]
+    return probs.cpu().numpy()
+
+
+def unet_presence_probs(
+    class_probs: np.ndarray,
+    min_pixels: Sequence[int],
+) -> np.ndarray:
+    """Image-level presence from the mean softmax of each class's top pixels."""
+    class_probs = np.asarray(class_probs)
+    flattened = class_probs[1 : 1 + len(min_pixels)].reshape(len(min_pixels), -1)
+    presence = []
+    for probs, min_px in zip(flattened, min_pixels):
+        k = max(1, min(int(min_px), probs.size))
+        presence.append(float(np.partition(probs, probs.size - k)[-k:].mean()))
+    return np.asarray(presence, dtype=np.float32)
+
+
+def fuse_probabilities(
+    classifier_probs: np.ndarray,
+    unet_probs: np.ndarray,
+    alpha: Sequence[float],
+) -> np.ndarray:
+    """Weighted ViT/U-Net image-level fusion; alpha is per defect class."""
+    alpha = np.asarray(alpha, dtype=np.float32)
+    classifier_probs = np.asarray(classifier_probs, dtype=np.float32)
+    return alpha * classifier_probs + (1.0 - alpha) * np.asarray(unet_probs, dtype=np.float32)
 
 
 def logistic_positive_proba(model: Any, features: np.ndarray) -> np.ndarray:
@@ -135,23 +161,30 @@ def mask_to_rgb(mask: np.ndarray) -> np.ndarray:
     return CLASS_COLORS[np.asarray(mask, dtype=np.int64)]
 
 
+def _threshold_vector(threshold: float | Sequence[float], count: int) -> np.ndarray:
+    values = np.asarray(threshold, dtype=np.float32)
+    return np.full(count, float(values), dtype=np.float32) if values.ndim == 0 else values
+
+
 def detected_defects(
     probs: np.ndarray,
-    threshold: float = 0.5,
+    threshold: float | Sequence[float] = 0.5,
     class_names: Sequence[str] = DEFECT_CLASS_NAMES,
 ) -> list[tuple[str, float]]:
     """`probs` is length-5 over defect classes (no background slot)."""
+    probs = np.asarray(probs)
+    thresholds = _threshold_vector(threshold, len(probs))
     return [
         (name, float(prob))
-        for name, prob in zip(class_names, np.asarray(probs))
-        if prob >= threshold
+        for name, prob, cutoff in zip(class_names, probs, thresholds)
+        if prob >= cutoff
     ]
 
 
 def conflict_messages(
     probs: np.ndarray,
     mask: np.ndarray,
-    threshold: float = 0.5,
+    threshold: float | Sequence[float] = 0.5,
     class_names: Sequence[str] = DEFECT_CLASS_NAMES,
 ) -> list[str]:
     """Deterministic ViT/U-Net disagreement report; never invents pixels.
@@ -159,17 +192,18 @@ def conflict_messages(
     `probs` indexes defect classes 0..4 corresponding to mask IDs 1..5.
     """
     probs = np.asarray(probs)
+    thresholds = _threshold_vector(threshold, len(probs))
     spatial = np.bincount(np.asarray(mask).ravel(), minlength=len(CLASS_NAMES)) > 0
     messages = []
     for index, name in enumerate(class_names):
         class_id = index + 1
         confidence = float(probs[index])
-        if confidence >= threshold and not spatial[class_id]:
+        if confidence >= thresholds[index] and not spatial[class_id]:
             messages.append(
                 f"Unlocalized Confidence Warning: ViT predicts {name} at "
                 f"{confidence:.0%}, but U-Net found no {name} pixels."
             )
-        elif confidence < threshold and spatial[class_id]:
+        elif confidence < thresholds[index] and spatial[class_id]:
             messages.append(
                 f"Sub-threshold Spatial Detection: U-Net found {name} pixels, "
                 f"but ViT confidence is {confidence:.0%}."

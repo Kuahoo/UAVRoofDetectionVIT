@@ -10,6 +10,9 @@ data:
   train_dir: train
   test_dir: test
   val_fraction: 0.15
+  # Group by tile stem so the four pre-augmented copies of a tile never
+  # straddle train/val. Use "flight" to hold out entire roofs instead.
+  group_by: tile
   # Matches TIDE default allocation (8 CPU cores). Reduce on smaller local machines.
   num_workers: 8
   image_size_classifier: 224
@@ -20,6 +23,7 @@ data:
 model:
   vit_name: vit_base_patch16_224
   vit_pretrained: true
+  vit_drop_path_rate: 0.2
   unet_encoder: resnet34
   unet_encoder_weights: imagenet
 
@@ -29,9 +33,13 @@ training:
   batch_size_unet: 8
   epochs_vit_warmup: 5
   epochs_vit_finetune: 15
-  epochs_unet: 20
+  epochs_unet: 40
   lr_vit_warmup: 0.001
   lr_vit_finetune: 0.00001
+  lr_vit_block_late: 0.00002
+  lr_vit_head: 0.0001
+  # Number of trailing ViT blocks unfrozen for fine-tuning.
+  vit_unfreeze_blocks: 6
   lr_unet: 0.0001
   weight_decay: 0.01
   grad_clip: 1.0
@@ -43,6 +51,14 @@ logistic:
   solver: lbfgs
   max_iter: 1000
   C: 1.0
+
+ensemble:
+  # Per-class weight on the ViT probability: strong on global-context classes,
+  # weak on patches/breaks where the U-Net's local recall is better.
+  alpha: [0.7, 0.7, 0.7, 0.3, 0.2]
+  # Top-k pixel pool for U-Net image-level presence (hollows, swellings,
+  # folds, patches, breaks) at 256x256.
+  min_pixels: [100, 100, 40, 30, 20]
 
 degradation:
   # Original test images are 1024x576. Each entry is (width, height).

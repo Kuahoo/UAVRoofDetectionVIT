@@ -8,12 +8,14 @@ mathematically identical ground truth.
 from __future__ import annotations
 
 import random
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
 import cv2
 import numpy as np
 import torch
+from sklearn.model_selection import GroupShuffleSplit
 from torch.utils.data import DataLoader, Dataset
 
 from src.utils import resolve_path, save_json, seed_worker
@@ -59,6 +61,33 @@ def _canonical_stem(path: Path) -> str:
         if lowered.endswith(suffix):
             return stem[: -len(suffix)]
     return stem
+
+
+def get_group_id(image_path: str | Path, group_by: str = "tile") -> str:
+    """RoofD source names are ``{aug_idx}_{flight_id}_{tile_idx}.png``.
+
+    ``tile`` groups the four pre-augmented copies of one tile; ``flight``
+    groups every tile captured for one roof/flight. Grouping prevents the
+    augmented copies of a tile from leaking into both train and validation.
+    """
+    if group_by not in {"tile", "flight"}:
+        raise ValueError(f"Unknown group_by: {group_by}")
+    no_aug = re.sub(r"^\d{4}_", "", Path(image_path).stem)
+    return re.sub(r"_\d{2}$", "", no_aug) if group_by == "flight" else no_aug
+
+
+def _split_train_val(
+    pairs: list[tuple[Path, Path]],
+    val_fraction: float,
+    seed: int,
+    group_by: str,
+) -> tuple[list[tuple[Path, Path]], list[tuple[Path, Path]]]:
+    groups = [get_group_id(image, group_by) for image, _ in pairs]
+    if len(set(groups)) < 2:
+        return pairs, []
+    splitter = GroupShuffleSplit(n_splits=1, test_size=val_fraction, random_state=seed)
+    train_idx, val_idx = next(splitter.split(pairs, groups=groups))
+    return [pairs[i] for i in train_idx], [pairs[i] for i in val_idx]
 
 
 def _find_named_dir(parent: Path, names: set[str]) -> Path | None:
@@ -159,9 +188,12 @@ def load_pairs(cfg: dict[str, Any], split: str, limit: int | None = None) -> lis
     if split == "train_full":
         return pairs
 
-    n_val = max(1, int(round(len(pairs) * cfg["data"]["val_fraction"])))
-    n_val = min(n_val, len(pairs) - 1) if len(pairs) > 1 else 0
-    val_pairs, train_pairs = pairs[:n_val], pairs[n_val:]
+    train_pairs, val_pairs = _split_train_val(
+        pairs,
+        float(cfg["data"]["val_fraction"]),
+        int(cfg["seed"]),
+        str(cfg["data"].get("group_by", "tile")),
+    )
     return train_pairs if split == "train" else val_pairs
 
 
@@ -174,6 +206,7 @@ def save_split_manifest(cfg: dict[str, Any]) -> dict[str, list[str]]:
         {
             "seed": cfg["seed"],
             "val_fraction": cfg["data"]["val_fraction"],
+            "group_by": cfg["data"].get("group_by", "tile"),
             "splits": splits,
         },
         cfg["paths"]["splits"],
@@ -450,22 +483,25 @@ def analyze_pairs(
     return stats
 
 
-def compute_pos_weight(stats: dict[str, Any]) -> torch.Tensor:
-    """Positive weights for the five defect classes (training image counts)."""
+def compute_pos_weight(stats: dict[str, Any], max_weight: float = 10.0) -> torch.Tensor:
+    """Dampened positive weights for the five defect classes.
+
+    Raw ``negatives / positives`` reaches ~50 for ``breaks`` and destabilizes
+    fine-tuning; the square root keeps rare classes important without
+    producing gradient spikes.
+    """
     counts = np.asarray(stats["image_counts"], dtype=np.float64)[1:]
     negatives = stats["num_pairs"] - counts
-    weights = np.where(counts > 0, negatives / np.maximum(counts, 1), 1.0)
+    raw = np.where(counts > 0, negatives / np.maximum(counts, 1), 1.0)
+    weights = np.minimum(np.sqrt(raw), max_weight)
     return torch.tensor(weights, dtype=torch.float32)
 
 
 def compute_class_weights(stats: dict[str, Any]) -> torch.Tensor:
+    """Log-smoothed pixel weights that emphasize rare classes."""
     counts = np.asarray(stats["pixel_counts"], dtype=np.float64)
     total = counts.sum()
     frequencies = counts / total if total > 0 else np.ones_like(counts) / len(counts)
-    positive = frequencies > 0
-    median = np.median(frequencies[positive]) if positive.any() else 1.0 / len(counts)
-    weights = np.full_like(frequencies, 1.0)
-    weights[positive] = median / frequencies[positive]
-    weights = np.clip(weights, 0.1, 20.0)
+    weights = 1.0 / np.log(1.02 + frequencies)
     weights = weights / weights.mean()
     return torch.tensor(weights, dtype=torch.float32)

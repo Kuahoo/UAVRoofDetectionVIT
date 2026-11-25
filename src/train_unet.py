@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from src.data import (
     CLASS_NAMES,
@@ -41,13 +42,15 @@ from src.utils import (
 
 
 class CombinedLoss(nn.Module):
-    def __init__(self, cross_entropy: nn.Module, dice: nn.Module) -> None:
+    """Focal loss suppresses easy background; Dice refines defect boundaries."""
+
+    def __init__(self, focal: nn.Module, dice: nn.Module) -> None:
         super().__init__()
-        self.cross_entropy = cross_entropy
+        self.focal = focal
         self.dice = dice
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return self.cross_entropy(logits, targets) + self.dice(logits, targets)
+        return 0.5 * self.focal(logits, targets) + 0.5 * self.dice(logits, targets)
 
 
 def parse_args() -> argparse.Namespace:
@@ -158,20 +161,26 @@ def main() -> None:
         in_channels=3,
         classes=len(CLASS_NAMES),
     ).to(device)
-    class_weights = compute_class_weights(stats).to(device)
+    class_weights = compute_class_weights(stats)
+    focal_kwargs: dict[str, Any] = {"mode": "multiclass", "gamma": 2.0}
+    if "class_weights" in inspect.signature(smp.losses.FocalLoss).parameters:
+        focal_kwargs["class_weights"] = class_weights.tolist()
+    else:  # segmentation-models-pytorch < 0.5
+        focal_kwargs["alpha"] = class_weights
     criterion = CombinedLoss(
-        nn.CrossEntropyLoss(weight=class_weights),
+        smp.losses.FocalLoss(**focal_kwargs),
         smp.losses.DiceLoss(mode="multiclass", from_logits=True),
     )
     optimizer = Adam(model.parameters(), lr=float(cfg["training"]["lr_unet"]))
-    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.1, patience=3)
+    epochs = int(cfg["training"]["epochs_unet"])
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     use_amp, scaler = amp_settings(device, bool(cfg["training"]["amp"]))
     grad_clip = float(cfg["training"]["grad_clip"])
     checkpoint_path = resolve_path(cfg["paths"]["checkpoints"]) / "unet_best.pt"
     history: list[dict[str, Any]] = []
     best_metric = float("-inf")
 
-    for epoch in range(1, int(cfg["training"]["epochs_unet"]) + 1):
+    for epoch in range(1, epochs + 1):
         train_loss, _, _ = run_epoch(
             model, train_loader, criterion, device, use_amp, optimizer, scaler, grad_clip
         )
@@ -197,7 +206,7 @@ def main() -> None:
                 },
                 checkpoint_path,
             )
-        scheduler.step(metric)
+        scheduler.step()
         history.append(
             {
                 "epoch": epoch,

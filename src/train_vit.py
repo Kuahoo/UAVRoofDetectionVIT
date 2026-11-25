@@ -26,6 +26,7 @@ from src.metrics import (
     plot_classification_samples,
     plot_confusion_counts,
     save_per_class_table,
+    tune_thresholds,
 )
 from src.utils import (
     amp_settings,
@@ -60,6 +61,7 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
     grad_clip: float = 0.0,
+    thresholds: float | list[float] = 0.5,
 ) -> tuple[float, dict[str, Any], np.ndarray, np.ndarray]:
     training = optimizer is not None
     model.train(training)
@@ -98,8 +100,39 @@ def run_epoch(
 
     probs = np.concatenate(all_probs)
     targets = np.concatenate(all_labels)
-    metrics = classification_metrics_from_probs(probs, targets)
+    metrics = classification_metrics_from_probs(probs, targets, threshold=thresholds)
     return total_loss / max(total_samples, 1), metrics, probs, targets
+
+
+def finetune_parameter_groups(
+    model: torch.nn.Module, cfg: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[torch.nn.Module]]:
+    """Unfrozen trailing blocks with layer-wise learning rates plus the head."""
+    requested = max(1, int(cfg["training"].get("vit_unfreeze_blocks", 6)))
+    blocks = list(model.blocks[-min(requested, len(model.blocks)) :])
+    split_at = len(blocks) // 2
+    early = blocks[:split_at] or blocks[:1]
+    late = blocks[split_at:] if split_at else []
+    groups = [
+        {
+            "params": [p for block in early for p in block.parameters()],
+            "lr": float(cfg["training"]["lr_vit_finetune"]),
+        }
+    ]
+    if late:
+        groups.append(
+            {
+                "params": [p for block in late for p in block.parameters()],
+                "lr": float(cfg["training"]["lr_vit_block_late"]),
+            }
+        )
+    groups.append(
+        {
+            "params": list(model.get_classifier().parameters()),
+            "lr": float(cfg["training"]["lr_vit_head"]),
+        }
+    )
+    return groups, blocks
 
 
 def main() -> None:
@@ -152,6 +185,7 @@ def main() -> None:
         pretrained=bool(cfg["model"]["vit_pretrained"]),
         num_classes=len(DEFECT_CLASS_NAMES),
         img_size=image_size,
+        drop_path_rate=float(cfg["model"].get("vit_drop_path_rate", 0.2)),
     ).to(device)
     for parameter in model.parameters():
         parameter.requires_grad_(False)
@@ -228,21 +262,21 @@ def main() -> None:
         )
         validate_and_save("warmup", epoch, train_loss, val_loss, val_metrics, optimizer)
 
-    # Phase 2: unfreeze the final two transformer blocks.
+    # Phase 2: unfreeze trailing blocks with layer-wise learning rates.
     if finetune_epochs > 0:
         if checkpoint_path.exists():
             model.load_state_dict(load_checkpoint(checkpoint_path, device)["model_state"])
         for parameter in model.parameters():
             parameter.requires_grad_(False)
-        for block in model.blocks[-2:]:
+        parameter_groups, unfrozen_blocks = finetune_parameter_groups(model, cfg)
+        for block in unfrozen_blocks:
             for parameter in block.parameters():
                 parameter.requires_grad_(True)
         for parameter in model.get_classifier().parameters():
             parameter.requires_grad_(True)
 
         optimizer = AdamW(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=float(cfg["training"]["lr_vit_finetune"]),
+            parameter_groups,
             weight_decay=float(cfg["training"]["weight_decay"]),
         )
         scheduler = CosineAnnealingLR(optimizer, T_max=finetune_epochs)
@@ -262,10 +296,28 @@ def main() -> None:
     if not checkpoint_path.exists():
         raise RuntimeError("No ViT checkpoint was produced; check the configured epochs")
 
-    model.load_state_dict(load_checkpoint(checkpoint_path, device)["model_state"])
-    test_loss, test_metrics, test_probs, test_targets = run_epoch(
-        model, test_loader, criterion, device, use_amp
+    checkpoint = load_checkpoint(checkpoint_path, device)
+    model.load_state_dict(checkpoint["model_state"])
+    _, _, val_probs, val_targets = run_epoch(
+        model, val_loader, criterion, device, use_amp
     )
+    thresholds = tune_thresholds(val_probs, val_targets)
+    tuned_val_metrics = classification_metrics_from_probs(
+        val_probs, val_targets, threshold=thresholds
+    )
+    checkpoint["thresholds"] = thresholds
+    checkpoint["val_macro_f1_tuned"] = tuned_val_metrics["macro_f1"]
+    save_checkpoint(checkpoint, checkpoint_path)
+    print(
+        "Tuned thresholds: "
+        + ", ".join(f"{name}={t:.2f}" for name, t in zip(DEFECT_CLASS_NAMES, thresholds))
+        + f" | val macro-F1 {tuned_val_metrics['macro_f1']:.4f}"
+    )
+
+    test_loss, test_metrics, test_probs, test_targets = run_epoch(
+        model, test_loader, criterion, device, use_amp, thresholds=thresholds
+    )
+    test_metrics["thresholds"] = thresholds
     metrics_dir = resolve_path(cfg["paths"]["metrics"])
     figures_dir = resolve_path(cfg["paths"]["figures"])
     np.save(metrics_dir / "vit_test_probs.npy", test_probs)

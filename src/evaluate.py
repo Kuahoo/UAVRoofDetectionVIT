@@ -11,7 +11,7 @@ import joblib
 import numpy as np
 import torch
 
-from src.data import CLASS_NAMES, RoofDDataset, load_pairs, make_loader
+from src.data import CLASS_NAMES, DEFECT_CLASS_NAMES, RoofDDataset, load_pairs, make_loader
 from src.features import extract_split
 from src.inference import (
     build_classifier,
@@ -31,6 +31,7 @@ from src.metrics import (
     save_degradation_table,
     save_per_class_table,
     segmentation_metrics,
+    tune_thresholds,
 )
 from src.utils import (
     amp_settings,
@@ -366,15 +367,16 @@ def evaluate_ensemble(
     unet_size = int(unet_ckpt.get("image_size", cfg["data"]["image_size_unet"]))
     mean = vit_ckpt.get("mean", cfg["data"]["mean"])
     std = vit_ckpt.get("std", cfg["data"]["std"])
-    thresholds = vit_ckpt.get("thresholds", 0.5)
+    vit_thresholds = vit_ckpt.get("thresholds", 0.5)
     alpha = cfg["ensemble"]["alpha"]
     min_pixels = cfg["ensemble"]["min_pixels"]
-    pairs = load_pairs(cfg, split)
     use_amp, _ = amp_settings(device, bool(cfg["training"]["amp"]))
+    metrics_dir = resolve_path(cfg["paths"]["metrics"])
 
-    def run(
+    def collect_fused(
+        pairs: Sequence[tuple[Path, Path]],
         degrade_resolution: tuple[int, int] | None,
-    ) -> tuple[dict[str, Any], np.ndarray, np.ndarray, tuple[Any, Any]]:
+    ) -> tuple[np.ndarray, np.ndarray, tuple[Any, Any], float]:
         vit_loader = _classification_loader(cfg, pairs, vit_size, degrade_resolution)
         vit_probs, labels, vit_elapsed, images, true_labels = collect_vit(
             vit, vit_loader, device, use_amp
@@ -384,10 +386,47 @@ def evaluate_ensemble(
             unet, unet_loader, device, use_amp, min_pixels
         )
         fused = fuse_probabilities(vit_probs, unet_probs, alpha)
+        return fused, labels, (images, true_labels), vit_elapsed + unet_elapsed
+
+    # Fused probabilities do not share the ViT's sigmoid calibration, especially
+    # on classes dominated by the U-Net term; tune once on validation fusion.
+    val_pairs = load_pairs(cfg, "val")
+    if val_pairs:
+        val_fused, val_labels, _, _ = collect_fused(val_pairs, None)
+        thresholds = tune_thresholds(val_fused, val_labels)
+        val_metrics = classification_metrics_from_probs(
+            val_fused, val_labels, threshold=thresholds
+        )
+        save_json(
+            {
+                "thresholds": thresholds,
+                "alpha": alpha,
+                "min_pixels": min_pixels,
+                "calibration_split": "val",
+                "val_macro_f1": val_metrics["macro_f1"],
+                "vit_thresholds": vit_thresholds,
+            },
+            metrics_dir / "ensemble_thresholds.json",
+        )
+        print(
+            "Ensemble thresholds: "
+            + ", ".join(f"{name}={t:.2f}" for name, t in zip(DEFECT_CLASS_NAMES, thresholds))
+        )
+    else:
+        thresholds = vit_thresholds
+        print("No validation pairs; falling back to ViT thresholds for fusion")
+
+    pairs = load_pairs(cfg, split)
+
+    def run(
+        degrade_resolution: tuple[int, int] | None,
+    ) -> tuple[dict[str, Any], np.ndarray, np.ndarray, tuple[Any, Any]]:
+        fused, labels, samples, elapsed = collect_fused(pairs, degrade_resolution)
         metrics = classification_metrics_from_probs(fused, labels, threshold=thresholds)
-        metrics["inference_ms_per_image"] = (vit_elapsed + unet_elapsed) / len(pairs) * 1000
+        metrics["inference_ms_per_image"] = elapsed / len(pairs) * 1000
         metrics["thresholds"] = thresholds
-        return metrics, fused, labels, (images, true_labels)
+        metrics["vit_thresholds"] = vit_thresholds
+        return metrics, fused, labels, samples
 
     if not degradation:
         metrics, probs, labels, samples = run(None)
@@ -403,7 +442,6 @@ def evaluate_ensemble(
         results.append(
             {"label": f"{resolution[0]}x{resolution[1]}", "resolution": resolution, "metrics": metrics}
         )
-    metrics_dir = resolve_path(cfg["paths"]["metrics"])
     save_json(results, metrics_dir / f"degradation_ensemble_{split}.json")
     save_degradation_table(results, metrics_dir / f"degradation_ensemble_{split}.csv", "classification")
     plot_degradation(

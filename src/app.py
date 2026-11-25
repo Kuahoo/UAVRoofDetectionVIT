@@ -24,7 +24,7 @@ from src.inference import (
     predict_segmentation_probs,
     unet_presence_probs,
 )
-from src.utils import get_device, load_config, resolve_path
+from src.utils import get_device, load_config, load_json, resolve_path
 
 DISCLAIMER = "For research demonstration only; professional inspection is required."
 
@@ -107,6 +107,13 @@ def main() -> None:
     cfg, device, vit, vit_ckpt, unet, unet_ckpt = load_models(
         config_path, cfg["training"]["device"]
     )
+    threshold_path = resolve_path(cfg["paths"]["metrics"]) / "ensemble_thresholds.json"
+    thresholds_calibrated = threshold_path.exists()
+    ensemble_thresholds = (
+        load_json(threshold_path)["thresholds"]
+        if thresholds_calibrated
+        else vit_ckpt.get("thresholds", 0.5)
+    )
     vit_size = int(vit_ckpt.get("image_size", cfg["data"]["image_size_classifier"]))
     unet_size = int(unet_ckpt.get("image_size", cfg["data"]["image_size_unet"]))
     vit_mean = vit_ckpt.get("mean", cfg["data"]["mean"])
@@ -122,9 +129,10 @@ def main() -> None:
     overlay = overlay_mask(image_rgb, mask)
     presence = unet_presence_probs(unet_probs, cfg["ensemble"]["min_pixels"])
     fused = fuse_probabilities(probs, presence, cfg["ensemble"]["alpha"])
-    thresholds = np.asarray(vit_ckpt.get("thresholds", 0.5), dtype=np.float32)
+    thresholds = np.asarray(ensemble_thresholds, dtype=np.float32)
+    vit_thresholds = np.asarray(vit_ckpt.get("thresholds", 0.5), dtype=np.float32)
     detected = detected_defects(fused, thresholds)
-    warnings = conflict_messages(probs, mask, thresholds)
+    warnings = conflict_messages(probs, mask, vit_thresholds)
 
     left, right = st.columns(2)
     with left:
@@ -147,6 +155,11 @@ def main() -> None:
         }
     )
     st.dataframe(table, use_container_width=True, hide_index=True)
+    if not thresholds_calibrated:
+        st.caption(
+            "Fusion thresholds are uncalibrated (using ViT thresholds). "
+            "Run `python -m src.evaluate --model ensemble` on TIDE to tune them."
+        )
 
     if detected:
         st.success(

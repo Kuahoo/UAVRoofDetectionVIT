@@ -216,8 +216,12 @@ python -m src.evaluate --model all --degradation
 `--model ensemble` pools each U-Net softmax mask into five image-level presence
 probabilities (mean of the top 100/100/40/30/20 pixels) and fuses them with the
 ViT probabilities using per-class weights `alpha=[0.7,0.7,0.7,0.3,0.2]`
-(`configs/default.yaml`). `--model all` evaluates ViT, U-Net, logistic, and the
-ensemble when both deep checkpoints exist.
+(`configs/default.yaml`). Fused probabilities have a different calibration from
+ViT sigmoids, so the ensemble sweeps its own per-class thresholds on validation
+fusion and writes `outputs/metrics/ensemble_thresholds.json`; the demo loads
+that file and falls back to ViT thresholds (with a caption) if it is absent.
+`--model all` evaluates ViT, U-Net, logistic, and the ensemble when both deep
+checkpoints exist.
 
 Standard evaluation writes per-class tables, JSON metrics, probability arrays,
 and figures. The degradation experiment evaluates the native 1024×576 test image
@@ -250,8 +254,8 @@ The sidebar accepts a config path. The app:
   augmented copies of a tile stay on one side. The test set stays untouched
   until evaluation.
 - `pos_weight`, segmentation class weights, and per-class thresholds are
-  computed from training/validation data only and cached or stored in the
-  checkpoints.
+  computed from training/validation data only; ViT thresholds live in
+  `vit_best.pt`, fusion thresholds in `outputs/metrics/ensemble_thresholds.json`.
 - **Primary train host:** TIDE L40 (48 GB). Configured batches are ViT 16 /
   U-Net 8 (also safe on ≥8 GB cards for local smoke debugging).
 - Smoke tests may run on CPU; full ViT/U-Net training should use a TIDE GPU
